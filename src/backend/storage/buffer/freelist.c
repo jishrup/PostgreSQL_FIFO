@@ -23,6 +23,40 @@
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
+#if BM_BUF_TYPE_FIFO
+/*
+ * Individual block of Buffers in the FIFO queue.
+ */
+typedef struct FIFOBufferNode 
+{
+    BufferDesc            *buf;               // Pointer to buffer descriptor
+    struct FIFOBufferNode *next;          // Pointer to the next node in the FIFO queue
+
+} FIFOBufferNode;
+
+
+/*
+ * The shared freelist control information for FIFO buffer management system.
+ * Private (non-shared) state for managing a FIFO buffer management system to re-use.
+ */
+typedef struct
+{
+	/*
+	 * Statistic variables indicating maximum size allowed in the 
+	 * FIFO queue and the current size of the FIFO queue. 
+	 * Note : max_size is always greater than equal to cursize.
+	 */
+	int 		        max_size;
+	int 		        cur_size;
+
+	/*
+	 * Indicates the head, tail and current last of the FIFO queue.
+	 */
+	FIFOBufferNode     *first_buffer;
+	FIFOBufferNode     *last_buffer;
+	FIFOBufferNode     *cur_last_buffer;
+} FIFOBufferStrategyControl;
+#endif 	
 
 /*
  * The shared freelist control information.
@@ -41,6 +75,13 @@ typedef struct
 
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
+
+	#if BM_BUF_TYPE_FIFO 
+	/*
+	 * Data Strucure to maintain FIFO Queue for FIFO Buffer Management Policy
+	 */
+	FIFOBufferStrategyControl *fifocontroller;
+	#endif 
 
 	/*
 	 * NOTE: lastFreeBuffer is undefined when firstFreeBuffer is -1 (that is,
@@ -90,7 +131,6 @@ typedef struct BufferAccessStrategyData
 	 */
 	Buffer		buffers[FLEXIBLE_ARRAY_MEMBER];
 }			BufferAccessStrategyData;
-
 
 /* Prototypes for internal functions */
 static BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy,
