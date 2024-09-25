@@ -86,6 +86,12 @@
 #define BM_BUF_TYPE_FIFO 1
 
 /*
+ * This flag tells the size of the FIFO queue
+ */
+#define BM_BUF_FIFO_QUEUE_SIZE 2048
+
+
+/*
  * Buffer tag identifies which disk block the buffer contains.
  *
  * Note: the BufferTag data must be sufficient to determine where to write the
