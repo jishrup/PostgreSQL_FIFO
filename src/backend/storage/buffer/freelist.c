@@ -20,9 +20,46 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
+#if BM_BUF_TYPE_FIFO
+#include "utils/memutils.h"
+#endif
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
+#if BM_BUF_TYPE_FIFO
+/*
+ * Individual block of Buffers in the FIFO queue.
+ */
+typedef struct FIFOBufferNode 
+{
+    int                    buf_id;               // buffer id of buffer descriptor
+    struct FIFOBufferNode *next;          // Pointer to the next node in the FIFO queue
+
+} FIFOBufferNode;
+
+
+/*
+ * The shared freelist control information for FIFO buffer management system.
+ * Private (non-shared) state for managing a FIFO buffer management system to re-use.
+ */
+typedef struct
+{
+	/*
+	 * Statistic variables indicating maximum size allowed in the 
+	 * FIFO queue and the current size of the FIFO queue. 
+	 * Note : max_size is always greater than equal to cursize.
+	 */
+	int 		        max_size;
+	int 		        cur_size;
+
+	/*
+	 * Indicates the head, tail and current last of the FIFO queue.
+	 */
+	FIFOBufferNode     *first_buffer;
+	FIFOBufferNode     *last_buffer;
+	FIFOBufferNode     *cur_last_buffer;
+} FIFOBufferStrategyControl;
+#endif 	
 
 /*
  * The shared freelist control information.
@@ -41,6 +78,13 @@ typedef struct
 
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
+
+	#if BM_BUF_TYPE_FIFO 
+	/*
+	 * Data Strucure to maintain FIFO Queue for FIFO Buffer Management Policy
+	 */
+	FIFOBufferStrategyControl *fifocontroller;
+	#endif 
 
 	/*
 	 * NOTE: lastFreeBuffer is undefined when firstFreeBuffer is -1 (that is,
@@ -90,7 +134,6 @@ typedef struct BufferAccessStrategyData
 	 */
 	Buffer		buffers[FLEXIBLE_ARRAY_MEMBER];
 }			BufferAccessStrategyData;
-
 
 /* Prototypes for internal functions */
 static BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy,
@@ -199,6 +242,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	int			bgwprocno;
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
+	#if BM_BUF_TYPE_FIFO
+	FIFOBufferNode *fifo_node;
+	FIFOBufferNode *prev_node = NULL;
+	bool 			first	  = true;
+	#endif
 
 	*from_ring = false;
 
@@ -248,6 +296,102 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	 * strategy object are intentionally not counted here.
 	 */
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
+
+	#if BM_BUF_TYPE_FIFO
+	/* 
+	 * If the Buffer FIFO Queue is full there is no point in getting the buffer from freelist. 
+	 * We need to get from the FIFO queue and return
+	 */
+	if(StrategyControl->fifocontroller->cur_size + 1 >= StrategyControl->fifocontroller->max_size) 
+	{
+		trycounter = StrategyControl->fifocontroller->max_size;
+
+		/* Acquire the spinlock get the first non pointer buffer */
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+		/* Retrieve the first buffer in the FIFO queue */
+		fifo_node = StrategyControl->fifocontroller->first_buffer;			
+		buf 	  = GetBufferDescriptor(fifo_node->buf_id);
+
+		/* Lock the buffer header to examine its state */
+		local_buf_state = LockBufHdr(buf);
+		/*
+ 		* Check if the buffer is pinned or has a nonzero usage_count.
+ 		* If pinned or being used, retry finding another buffer (FIFO should handle it).
+ 		*/
+		while(fifo_node != StrategyControl->fifocontroller->cur_last_buffer)
+		{
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0) 
+			{
+				break;
+			}
+
+			/* Buffer is not usable, unlock and retry */
+			UnlockBufHdr(buf, local_buf_state);
+			first = false;
+			prev_node = fifo_node;
+			trycounter--;
+			fifo_node = fifo_node->next;
+			buf = GetBufferDescriptor(fifo_node->buf_id);
+			Assert(buf->freeNext != FREENEXT_NOT_IN_LIST);
+	
+			/* Lock the buffer header to examine its state */
+			local_buf_state = LockBufHdr(buf);
+		}
+
+		if(first) 
+		{
+			StrategyControl->fifocontroller->first_buffer = StrategyControl->fifocontroller->first_buffer->next;
+			StrategyControl->fifocontroller->last_buffer->next = fifo_node;
+			StrategyControl->fifocontroller->last_buffer = fifo_node;
+			StrategyControl->fifocontroller->last_buffer->next = NULL;
+			StrategyControl->fifocontroller->last_buffer->buf_id = -1;
+			StrategyControl->fifocontroller->cur_size--;
+
+			/* Release the spinlock */
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			/* Found a usable buffer */
+			if (strategy != NULL)
+				AddBufferToRing(strategy, buf);
+			*buf_state = local_buf_state;
+			return buf;
+		} else 
+		{
+			if((fifo_node == StrategyControl->fifocontroller->cur_last_buffer || trycounter == 1) 
+			&& BUF_STATE_GET_REFCOUNT(local_buf_state) != 0) 
+			{
+				UnlockBufHdr(buf, local_buf_state);
+
+				/* Release the spinlock */
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+				elog(ERROR, "no unpinned buffers available in FIFO queue");
+			}
+
+			if(fifo_node == StrategyControl->fifocontroller->cur_last_buffer) 
+			{
+				StrategyControl->fifocontroller->cur_last_buffer = prev_node;
+			}
+
+			prev_node->next = fifo_node->next;
+			StrategyControl->fifocontroller->last_buffer->next = fifo_node;
+			StrategyControl->fifocontroller->last_buffer = fifo_node;
+			StrategyControl->fifocontroller->last_buffer->next = NULL;
+			StrategyControl->fifocontroller->last_buffer->buf_id = -1;
+			StrategyControl->fifocontroller->cur_size--;
+			
+			/* Release the spinlock */
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			
+			/* Found a usable buffer */
+			if (strategy != NULL)
+				AddBufferToRing(strategy, buf);
+			*buf_state = local_buf_state;
+			return buf;
+		}	
+	}
+	#endif
 
 	/*
 	 * First check, without acquiring the lock, whether there's buffers in the
@@ -299,6 +443,29 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * of 8.3, but we'd better check anyway.)
 			 */
 			local_buf_state = LockBufHdr(buf);
+			#if BM_BUF_TYPE_FIFO
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				*buf_state = local_buf_state;
+
+				/* Acquire the spinlock to push into the FIFO queue */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+				/* Check if the FIFO queue has reached its capacity, this should never happen for this case.*/
+				Assert(StrategyControl->fifocontroller->cur_size + 1 <= StrategyControl->fifocontroller->max_size);
+
+				/*  Assign this buffer at the end of FIFO queue */
+				StrategyControl->fifocontroller->cur_last_buffer->buf_id = buf->buf_id;
+				StrategyControl->fifocontroller->cur_size++;
+				StrategyControl->fifocontroller->cur_last_buffer = StrategyControl->fifocontroller->cur_last_buffer->next;
+
+				/* Release the spinlock as the buffer is added to the queue */
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				return buf;
+			}
+			#else
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
 			{
@@ -307,12 +474,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 				*buf_state = local_buf_state;
 				return buf;
 			}
+			#endif
 			UnlockBufHdr(buf, local_buf_state);
 		}
 	}
 
+	#if !BM_BUF_TYPE_FIFO
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
 	trycounter = NBuffers;
+	
 	for (;;)
 	{
 		buf = GetBufferDescriptor(ClockSweepTick());
@@ -354,6 +524,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		}
 		UnlockBufHdr(buf, local_buf_state);
 	}
+	#endif
+
+	// Fallback: If all else fails, log an error and return NULL
+	elog(ERROR, "StrategyGetBuffer: No buffer could be allocated.");
+	return NULL;
 }
 
 /*
@@ -474,6 +649,10 @@ void
 StrategyInitialize(bool init)
 {
 	bool		found;
+	#if BM_BUF_TYPE_FIFO
+	FIFOBufferNode *node      = NULL;
+	FIFOBufferNode *prev_node = NULL;
+	#endif
 
 	/*
 	 * Initialize the shared buffer lookup hashtable.
@@ -510,6 +689,48 @@ StrategyInitialize(bool init)
 		 */
 		StrategyControl->firstFreeBuffer = 0;
 		StrategyControl->lastFreeBuffer = NBuffers - 1;
+
+		#if BM_BUF_TYPE_FIFO
+		/*
+		 * Intialize FIFOBufferStrategyControl block of StrategyControl
+		 * for FIFO buffer management strategy.
+		 */
+		StrategyControl->fifocontroller = (FIFOBufferStrategyControl *)ShmemAlloc(sizeof(FIFOBufferStrategyControl));
+
+		StrategyControl->fifocontroller->first_buffer    = NULL;
+		StrategyControl->fifocontroller->last_buffer     = NULL;
+		StrategyControl->fifocontroller->cur_last_buffer = NULL;
+
+		/*
+		 * ALlocate memory for NBuffers of type FIFOBufferNode so that 
+		 * no more further allocation are required.
+		 */
+		for(int i = 0; i < BM_BUF_FIFO_QUEUE_SIZE; i++) {
+			node = (FIFOBufferNode *)ShmemAlloc(sizeof(FIFOBufferNode));
+
+			if (node == NULL) {
+    			elog(ERROR, "Memory allocation failed for FIFOBufferNode.");
+			}
+
+			if(StrategyControl->fifocontroller->first_buffer == NULL) {
+				StrategyControl->fifocontroller->first_buffer = node;
+				StrategyControl->fifocontroller->cur_last_buffer = node;
+			} else {
+				prev_node->next = node;
+			}
+			node->next = NULL;
+			node->buf_id = -1;
+			prev_node = node;
+		}
+
+		StrategyControl->fifocontroller->last_buffer = node;
+
+		/*
+		 * Set the Statistic variables for FIFO buffer management strategy.
+		 */
+		StrategyControl->fifocontroller->max_size = BM_BUF_FIFO_QUEUE_SIZE;
+		StrategyControl->fifocontroller->cur_size = 0;
+		#endif
 
 		/* Initialize the clock sweep pointer */
 		pg_atomic_init_u32(&StrategyControl->nextVictimBuffer, 0);
